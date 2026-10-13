@@ -1,0 +1,11 @@
+[package]
+name = "cf-file-manager"
+version = "0.1.0"
+edition = "2024"
+description = "A simple cross-platform desktop file manager built with Rust and egui"
+license = "MIT"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+eframe = { version = "0.36.2", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+open = "5.3"
