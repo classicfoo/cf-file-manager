@@ -14,9 +14,13 @@ const MUTED: Color32 = Color32::from_rgb(151, 162, 180);
 const PATH_INPUT_ID: &str = "location_input";
 
 fn main() -> eframe::Result {
+    let app_icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+        .expect("the embedded application icon must be a valid PNG");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("CF File Manager")
+            .with_app_id("cf-file-manager")
+            .with_icon(app_icon)
             .with_inner_size([1120.0, 740.0])
             .with_min_inner_size([780.0, 520.0]),
         renderer: eframe::Renderer::Glow,
@@ -80,9 +84,8 @@ impl FileManagerApp {
         visuals.selection.bg_fill = ACCENT;
         creation_context.egui_ctx.set_visuals(visuals);
 
-        let home = home_dir().unwrap_or_else(|| {
-            env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-        });
+        let home =
+            home_dir().unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         let current_dir = fs::canonicalize(&home).unwrap_or(home);
         let mut app = Self {
             current_dir: current_dir.clone(),
@@ -308,7 +311,7 @@ impl FileManagerApp {
             .collect()
     }
 
-    fn show_toolbar(&mut self, ctx: &egui::Context) {
+    fn show_toolbar(&mut self, ui: &mut egui::Ui) {
         let mut requested_path = None;
         let mut refresh = false;
         let mut new_folder = false;
@@ -320,22 +323,36 @@ impl FileManagerApp {
         let can_go_forward = self.history_index + 1 < self.history.len();
         let has_selection = self.selected.is_some();
 
-        egui::TopBottomPanel::top("toolbar")
-            .frame(egui::Frame::default().fill(PANEL).inner_margin(egui::Margin::symmetric(14, 10)))
-            .show(ctx, |ui| {
+        egui::Panel::top("toolbar")
+            .frame(
+                egui::Frame::default()
+                    .fill(PANEL)
+                    .inner_margin(egui::Margin::symmetric(14, 10)),
+            )
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading(egui::RichText::new("CF File Manager").strong());
                     ui.add_space(12.0);
-                    if ui.add_enabled(can_go_back, egui::Button::new("‹")).on_hover_text("Back").clicked() {
+                    if icon_button(ui, Icon::Back, "Back", "Alt+Left", 64.0, can_go_back).clicked()
+                    {
                         self.go_back();
                     }
-                    if ui.add_enabled(can_go_forward, egui::Button::new("›")).on_hover_text("Forward").clicked() {
+                    if icon_button(
+                        ui,
+                        Icon::Forward,
+                        "Forward",
+                        "Alt+Right",
+                        78.0,
+                        can_go_forward,
+                    )
+                    .clicked()
+                    {
                         self.go_forward();
                     }
-                    if ui.button("Up").on_hover_text("Open parent folder").clicked() {
+                    if icon_button(ui, Icon::Up, "Up", "Open parent folder", 54.0, true).clicked() {
                         self.go_up();
                     }
-                    if ui.button("Refresh").clicked() {
+                    if icon_button(ui, Icon::Refresh, "Refresh", "Ctrl+R", 78.0, true).clicked() {
                         refresh = true;
                     }
 
@@ -346,13 +363,16 @@ impl FileManagerApp {
                             .id(egui::Id::new(PATH_INPUT_ID))
                             .hint_text("Enter a folder path"),
                     );
+                    response.clone().on_hover_text("Location (Ctrl+L)");
                     if self.focus_location {
                         response.request_focus();
                         self.focus_location = false;
                     }
                     let enter_pressed = response.lost_focus()
                         && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                    if ui.button("Go").clicked() || enter_pressed {
+                    if icon_button(ui, Icon::Open, "Go", "Open this location", 54.0, true).clicked()
+                        || enter_pressed
+                    {
                         let entered_path = PathBuf::from(self.path_input.clone());
                         requested_path = Some(if entered_path.is_absolute() {
                             entered_path
@@ -364,24 +384,64 @@ impl FileManagerApp {
 
                 ui.add_space(7.0);
                 ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [250.0, 29.0],
-                        egui::TextEdit::singleline(&mut self.search).hint_text("Search this folder"),
-                    );
+                    ui.horizontal(|ui| {
+                        draw_icon(ui, Icon::Search, MUTED, 16.0);
+                        ui.add_sized(
+                            [250.0, 29.0],
+                            egui::TextEdit::singleline(&mut self.search)
+                                .hint_text("Search this folder"),
+                        );
+                    });
                     let hidden_toggle = ui
                         .checkbox(&mut self.show_hidden, "Show hidden dotfiles")
                         .on_hover_text("Include names that start with a dot");
                     hidden_changed = hidden_toggle.changed();
-                    if ui.button("New folder").clicked() {
+                    if icon_button(
+                        ui,
+                        Icon::FolderPlus,
+                        "New folder",
+                        "Ctrl+Shift+N",
+                        112.0,
+                        true,
+                    )
+                    .clicked()
+                    {
                         new_folder = true;
                     }
-                    if ui.add_enabled(has_selection, egui::Button::new("Rename")).clicked() {
+                    if icon_button(
+                        ui,
+                        Icon::Rename,
+                        "Rename",
+                        "Rename selected item",
+                        82.0,
+                        has_selection,
+                    )
+                    .clicked()
+                    {
                         rename = true;
                     }
-                    if ui.add_enabled(has_selection, egui::Button::new("Delete")).clicked() {
+                    if icon_button(
+                        ui,
+                        Icon::Delete,
+                        "Delete",
+                        "Delete (confirm)",
+                        76.0,
+                        has_selection,
+                    )
+                    .clicked()
+                    {
                         delete = true;
                     }
-                    if ui.add_enabled(has_selection, egui::Button::new("Open")).clicked() {
+                    if icon_button(
+                        ui,
+                        Icon::Open,
+                        "Open",
+                        "Open selected item",
+                        68.0,
+                        has_selection,
+                    )
+                    .clicked()
+                    {
                         open = true;
                     }
                 });
@@ -407,33 +467,42 @@ impl FileManagerApp {
         }
     }
 
-    fn show_sidebar(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
+    fn show_sidebar(&mut self, ui: &mut egui::Ui) -> Option<PathBuf> {
         let mut requested_path = None;
-        egui::SidePanel::left("places")
+        egui::Panel::left("places")
             .resizable(true)
-            .default_width(205.0)
-            .min_width(165.0)
-            .max_width(280.0)
-            .frame(egui::Frame::default().fill(PANEL).inner_margin(egui::Margin::symmetric(12, 14)))
-            .show(ctx, |ui| {
+            .default_size(205.0)
+            .min_size(165.0)
+            .max_size(280.0)
+            .frame(
+                egui::Frame::default()
+                    .fill(PANEL)
+                    .inner_margin(egui::Margin::symmetric(12, 14)),
+            )
+            .show(ui, |ui| {
                 ui.label(egui::RichText::new("PLACES").small().strong().color(MUTED));
                 ui.add_space(8.0);
                 if let Some(home) = home_dir() {
                     for (label, path) in standard_places(&home) {
                         let active = self.current_dir == path;
-                        if ui.selectable_label(active, label).clicked() {
+                        if place_button(ui, place_icon(label), label, active).clicked() {
                             requested_path = Some(path);
                         }
                     }
                 }
 
                 ui.add_space(18.0);
-                ui.label(egui::RichText::new("FILESYSTEM").small().strong().color(MUTED));
+                ui.label(
+                    egui::RichText::new("FILESYSTEM")
+                        .small()
+                        .strong()
+                        .color(MUTED),
+                );
                 ui.add_space(8.0);
                 for root in filesystem_roots() {
                     let active = self.current_dir == root;
                     let label = root_label(&root);
-                    if ui.selectable_label(active, label).clicked() {
+                    if place_button(ui, Icon::Drive, &label, active).clicked() {
                         requested_path = Some(root);
                     }
                 }
@@ -441,15 +510,19 @@ impl FileManagerApp {
         requested_path
     }
 
-    fn show_file_list(&mut self, ctx: &egui::Context) {
+    fn show_file_list(&mut self, ui: &mut egui::Ui) {
         let mut clicked_path = None;
         let mut opened_path = None;
         let entries = self.filtered_entries();
         let selected = self.selected.clone();
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(Color32::from_rgb(19, 23, 30)).inner_margin(egui::Margin::symmetric(18, 14)))
-            .show(ctx, |ui| {
+            .frame(
+                egui::Frame::default()
+                    .fill(Color32::from_rgb(19, 23, 30))
+                    .inner_margin(egui::Margin::symmetric(18, 14)),
+            )
+            .show(ui, |ui| {
                 let folder_name = self
                     .current_dir
                     .file_name()
@@ -509,16 +582,20 @@ impl FileManagerApp {
         }
     }
 
-    fn show_status(&self, ctx: &egui::Context) {
+    fn show_status(&self, ui: &mut egui::Ui) {
         let query = self.search.trim().to_lowercase();
         let visible_count = self
             .entries
             .iter()
             .filter(|entry| query.is_empty() || entry.name.to_lowercase().contains(&query))
             .count();
-        egui::TopBottomPanel::bottom("status")
-            .frame(egui::Frame::default().fill(PANEL).inner_margin(egui::Margin::symmetric(14, 6)))
-            .show(ctx, |ui| {
+        egui::Panel::bottom("status")
+            .frame(
+                egui::Frame::default()
+                    .fill(PANEL)
+                    .inner_margin(egui::Margin::symmetric(14, 6)),
+            )
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     if let Some(status) = &self.status {
                         ui.colored_label(Color32::from_rgb(255, 174, 120), status);
@@ -604,7 +681,10 @@ impl FileManagerApp {
                     ui.label(egui::RichText::new(path.display().to_string()).color(MUTED));
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        if ui.button(egui::RichText::new("Delete").color(Color32::WHITE)).clicked() {
+                        if ui
+                            .button(egui::RichText::new("Delete").color(Color32::WHITE))
+                            .clicked()
+                        {
                             action = Some(DialogAction::Delete(path.clone()));
                         }
                         if ui.button("Cancel").clicked() {
@@ -629,7 +709,7 @@ impl FileManagerApp {
 impl eframe::App for FileManagerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        let shortcuts_enabled = !ctx.wants_keyboard_input();
+        let shortcuts_enabled = !ctx.egui_wants_keyboard_input();
         if shortcuts_enabled {
             let (back, forward, refresh, focus_location, new_folder, delete) = ctx.input(|input| {
                 (
@@ -663,12 +743,12 @@ impl eframe::App for FileManagerApp {
             }
         }
 
-        self.show_toolbar(&ctx);
-        if let Some(path) = self.show_sidebar(&ctx) {
+        self.show_toolbar(ui);
+        if let Some(path) = self.show_sidebar(ui) {
             self.navigate_to(&path, true);
         }
-        self.show_status(&ctx);
-        self.show_file_list(&ctx);
+        self.show_status(ui);
+        self.show_file_list(ui);
         self.show_dialog(&ctx);
     }
 }
@@ -719,6 +799,429 @@ fn root_label(path: &Path) -> String {
     {
         let _ = path;
         "File system".to_owned()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Icon {
+    Back,
+    Forward,
+    Up,
+    Refresh,
+    Search,
+    FolderPlus,
+    Rename,
+    Delete,
+    Open,
+    Folder,
+    File,
+    Home,
+    Desktop,
+    Documents,
+    Downloads,
+    Pictures,
+    Music,
+    Videos,
+    Drive,
+}
+
+fn icon_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    hint: &str,
+    width: f32,
+    enabled: bool,
+) -> egui::Response {
+    let response = ui.add_enabled(
+        enabled,
+        egui::Button::new("").min_size(Vec2::new(width, 29.0)),
+    );
+    let rect = response.rect;
+    let tint = if enabled {
+        ui.visuals().text_color()
+    } else {
+        MUTED
+    };
+    paint_icon(
+        ui.painter(),
+        icon,
+        Rect::from_min_size(rect.min + Vec2::new(7.0, 7.0), Vec2::splat(16.0)),
+        tint,
+    );
+    ui.painter().text(
+        Pos2::new(rect.left() + 28.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(13.0),
+        tint,
+    );
+    response.on_hover_text(hint)
+}
+
+fn place_button(ui: &mut egui::Ui, icon: Icon, label: &str, selected: bool) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 27.0), Sense::click());
+    if selected || response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(4),
+            if selected {
+                Color32::from_rgb(41, 73, 117)
+            } else {
+                Color32::from_rgb(33, 41, 54)
+            },
+        );
+    }
+    paint_icon(
+        ui.painter(),
+        icon,
+        Rect::from_min_size(rect.min + Vec2::new(9.0, 6.0), Vec2::splat(15.0)),
+        if selected { Color32::WHITE } else { MUTED },
+    );
+    ui.painter().text(
+        Pos2::new(rect.left() + 32.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(13.0),
+        if selected {
+            Color32::WHITE
+        } else {
+            Color32::from_rgb(220, 225, 234)
+        },
+    );
+    response
+}
+
+fn place_icon(label: &str) -> Icon {
+    match label {
+        "Home" => Icon::Home,
+        "Desktop" => Icon::Desktop,
+        "Documents" => Icon::Documents,
+        "Downloads" => Icon::Downloads,
+        "Pictures" => Icon::Pictures,
+        "Music" => Icon::Music,
+        "Videos" => Icon::Videos,
+        _ => Icon::Folder,
+    }
+}
+
+fn draw_icon(ui: &mut egui::Ui, icon: Icon, color: Color32, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    paint_icon(ui.painter(), icon, rect, color);
+}
+
+fn paint_icon(painter: &egui::Painter, icon: Icon, rect: Rect, color: Color32) {
+    let s = egui::Stroke::new(1.6, color);
+    let x = rect.left();
+    let y = rect.top();
+    let w = rect.width();
+    let h = rect.height();
+    let line = |a, b| painter.line_segment([a, b], s);
+    match icon {
+        Icon::Back => {
+            line(
+                Pos2::new(x + w * 0.82, y + h * 0.5),
+                Pos2::new(x + w * 0.18, y + h * 0.5),
+            );
+            line(
+                Pos2::new(x + w * 0.43, y + h * 0.23),
+                Pos2::new(x + w * 0.18, y + h * 0.5),
+            );
+            line(
+                Pos2::new(x + w * 0.18, y + h * 0.5),
+                Pos2::new(x + w * 0.43, y + h * 0.77),
+            );
+        }
+        Icon::Forward => {
+            line(
+                Pos2::new(x + w * 0.18, y + h * 0.5),
+                Pos2::new(x + w * 0.82, y + h * 0.5),
+            );
+            line(
+                Pos2::new(x + w * 0.57, y + h * 0.23),
+                Pos2::new(x + w * 0.82, y + h * 0.5),
+            );
+            line(
+                Pos2::new(x + w * 0.82, y + h * 0.5),
+                Pos2::new(x + w * 0.57, y + h * 0.77),
+            );
+        }
+        Icon::Up => {
+            line(
+                Pos2::new(x + w * 0.5, y + h * 0.82),
+                Pos2::new(x + w * 0.5, y + h * 0.18),
+            );
+            line(
+                Pos2::new(x + w * 0.23, y + h * 0.43),
+                Pos2::new(x + w * 0.5, y + h * 0.18),
+            );
+            line(
+                Pos2::new(x + w * 0.5, y + h * 0.18),
+                Pos2::new(x + w * 0.77, y + h * 0.43),
+            );
+        }
+        Icon::Refresh => {
+            painter.circle_stroke(rect.center(), w * 0.34, s);
+            line(
+                Pos2::new(x + w * 0.67, y + h * 0.1),
+                Pos2::new(x + w * 0.9, y + h * 0.12),
+            );
+            line(
+                Pos2::new(x + w * 0.9, y + h * 0.12),
+                Pos2::new(x + w * 0.85, y + h * 0.35),
+            );
+        }
+        Icon::Search => {
+            painter.circle_stroke(Pos2::new(x + w * 0.42, y + h * 0.42), w * 0.29, s);
+            line(
+                Pos2::new(x + w * 0.63, y + h * 0.63),
+                Pos2::new(x + w * 0.92, y + h * 0.92),
+            );
+        }
+        Icon::Folder | Icon::FolderPlus | Icon::Downloads => {
+            let points = [
+                Pos2::new(x + w * 0.10, y + h * 0.32),
+                Pos2::new(x + w * 0.10, y + h * 0.18),
+                Pos2::new(x + w * 0.42, y + h * 0.18),
+                Pos2::new(x + w * 0.42, y + h * 0.32),
+                Pos2::new(x + w * 0.90, y + h * 0.32),
+                Pos2::new(x + w * 0.90, y + h * 0.84),
+                Pos2::new(x + w * 0.10, y + h * 0.84),
+                Pos2::new(x + w * 0.10, y + h * 0.32),
+            ];
+            painter.add(egui::Shape::line(points.to_vec(), s));
+            if matches!(icon, Icon::FolderPlus) {
+                line(
+                    Pos2::new(x + w * 0.5, y + h * 0.5),
+                    Pos2::new(x + w * 0.5, y + h * 0.76),
+                );
+                line(
+                    Pos2::new(x + w * 0.37, y + h * 0.63),
+                    Pos2::new(x + w * 0.63, y + h * 0.63),
+                );
+            }
+            if matches!(icon, Icon::Downloads) {
+                line(
+                    Pos2::new(x + w * 0.5, y + h * 0.44),
+                    Pos2::new(x + w * 0.5, y + h * 0.68),
+                );
+                line(
+                    Pos2::new(x + w * 0.38, y + h * 0.57),
+                    Pos2::new(x + w * 0.5, y + h * 0.69),
+                );
+                line(
+                    Pos2::new(x + w * 0.62, y + h * 0.57),
+                    Pos2::new(x + w * 0.5, y + h * 0.69),
+                );
+            }
+        }
+        Icon::File | Icon::Documents => {
+            let page = [
+                Pos2::new(x + w * 0.22, y + h * 0.08),
+                Pos2::new(x + w * 0.60, y + h * 0.08),
+                Pos2::new(x + w * 0.80, y + h * 0.28),
+                Pos2::new(x + w * 0.80, y + h * 0.92),
+                Pos2::new(x + w * 0.22, y + h * 0.92),
+                Pos2::new(x + w * 0.22, y + h * 0.08),
+            ];
+            painter.add(egui::Shape::line(page.to_vec(), s));
+            line(
+                Pos2::new(x + w * 0.60, y + h * 0.08),
+                Pos2::new(x + w * 0.60, y + h * 0.28),
+            );
+            line(
+                Pos2::new(x + w * 0.60, y + h * 0.28),
+                Pos2::new(x + w * 0.80, y + h * 0.28),
+            );
+            line(
+                Pos2::new(x + w * 0.32, y + h * 0.48),
+                Pos2::new(x + w * 0.68, y + h * 0.48),
+            );
+            line(
+                Pos2::new(x + w * 0.32, y + h * 0.64),
+                Pos2::new(x + w * 0.68, y + h * 0.64),
+            );
+            if matches!(icon, Icon::Documents) {
+                line(
+                    Pos2::new(x + w * 0.32, y + h * 0.78),
+                    Pos2::new(x + w * 0.58, y + h * 0.78),
+                );
+            }
+        }
+        Icon::Rename => {
+            let pencil = [
+                Pos2::new(x + w * 0.12, y + h * 0.88),
+                Pos2::new(x + w * 0.25, y + h * 0.84),
+                Pos2::new(x + w * 0.78, y + h * 0.30),
+                Pos2::new(x + w * 0.65, y + h * 0.17),
+                Pos2::new(x + w * 0.16, y + h * 0.72),
+                Pos2::new(x + w * 0.12, y + h * 0.88),
+            ];
+            painter.add(egui::Shape::line(pencil.to_vec(), s));
+        }
+        Icon::Delete => {
+            line(
+                Pos2::new(x + w * 0.18, y + h * 0.30),
+                Pos2::new(x + w * 0.82, y + h * 0.30),
+            );
+            painter.rect_stroke(
+                Rect::from_min_max(
+                    Pos2::new(x + w * 0.27, y + h * 0.36),
+                    Pos2::new(x + w * 0.73, y + h * 0.88),
+                ),
+                egui::CornerRadius::ZERO,
+                s,
+                egui::StrokeKind::Inside,
+            );
+            line(
+                Pos2::new(x + w * 0.40, y + h * 0.16),
+                Pos2::new(x + w * 0.60, y + h * 0.16),
+            );
+            line(
+                Pos2::new(x + w * 0.45, y + h * 0.16),
+                Pos2::new(x + w * 0.45, y + h * 0.27),
+            );
+            line(
+                Pos2::new(x + w * 0.55, y + h * 0.16),
+                Pos2::new(x + w * 0.55, y + h * 0.27),
+            );
+            line(
+                Pos2::new(x + w * 0.43, y + h * 0.48),
+                Pos2::new(x + w * 0.43, y + h * 0.76),
+            );
+            line(
+                Pos2::new(x + w * 0.57, y + h * 0.48),
+                Pos2::new(x + w * 0.57, y + h * 0.76),
+            );
+        }
+        Icon::Open => {
+            line(
+                Pos2::new(x + w * 0.16, y + h * 0.5),
+                Pos2::new(x + w * 0.84, y + h * 0.5),
+            );
+            line(
+                Pos2::new(x + w * 0.58, y + h * 0.24),
+                Pos2::new(x + w * 0.84, y + h * 0.5),
+            );
+            line(
+                Pos2::new(x + w * 0.58, y + h * 0.76),
+                Pos2::new(x + w * 0.84, y + h * 0.5),
+            );
+        }
+        Icon::Home => {
+            let house = [
+                Pos2::new(x + w * 0.10, y + h * 0.48),
+                Pos2::new(x + w * 0.50, y + h * 0.14),
+                Pos2::new(x + w * 0.90, y + h * 0.48),
+                Pos2::new(x + w * 0.76, y + h * 0.48),
+                Pos2::new(x + w * 0.76, y + h * 0.88),
+                Pos2::new(x + w * 0.24, y + h * 0.88),
+                Pos2::new(x + w * 0.24, y + h * 0.48),
+                Pos2::new(x + w * 0.10, y + h * 0.48),
+            ];
+            painter.add(egui::Shape::line(house.to_vec(), s));
+            painter.rect_stroke(
+                Rect::from_min_max(
+                    Pos2::new(x + w * 0.43, y + h * 0.64),
+                    Pos2::new(x + w * 0.57, y + h * 0.88),
+                ),
+                egui::CornerRadius::ZERO,
+                s,
+                egui::StrokeKind::Inside,
+            );
+        }
+        Icon::Desktop => {
+            painter.rect_stroke(
+                Rect::from_min_max(
+                    Pos2::new(x + w * 0.08, y + h * 0.12),
+                    Pos2::new(x + w * 0.92, y + h * 0.68),
+                ),
+                egui::CornerRadius::same(2),
+                s,
+                egui::StrokeKind::Inside,
+            );
+            line(
+                Pos2::new(x + w * 0.5, y + h * 0.68),
+                Pos2::new(x + w * 0.5, y + h * 0.86),
+            );
+            line(
+                Pos2::new(x + w * 0.3, y + h * 0.88),
+                Pos2::new(x + w * 0.7, y + h * 0.88),
+            );
+        }
+        Icon::Pictures => {
+            painter.rect_stroke(
+                Rect::from_min_max(
+                    Pos2::new(x + w * 0.1, y + h * 0.12),
+                    Pos2::new(x + w * 0.9, y + h * 0.88),
+                ),
+                egui::CornerRadius::same(2),
+                s,
+                egui::StrokeKind::Inside,
+            );
+            painter.circle_filled(Pos2::new(x + w * 0.68, y + h * 0.34), w * 0.08, color);
+            line(
+                Pos2::new(x + w * 0.18, y + h * 0.75),
+                Pos2::new(x + w * 0.43, y + h * 0.48),
+            );
+            line(
+                Pos2::new(x + w * 0.43, y + h * 0.48),
+                Pos2::new(x + w * 0.82, y + h * 0.75),
+            );
+        }
+        Icon::Music => {
+            line(
+                Pos2::new(x + w * 0.40, y + h * 0.22),
+                Pos2::new(x + w * 0.40, y + h * 0.70),
+            );
+            line(
+                Pos2::new(x + w * 0.40, y + h * 0.22),
+                Pos2::new(x + w * 0.78, y + h * 0.12),
+            );
+            line(
+                Pos2::new(x + w * 0.78, y + h * 0.12),
+                Pos2::new(x + w * 0.78, y + h * 0.58),
+            );
+            painter.circle_filled(Pos2::new(x + w * 0.26, y + h * 0.74), w * 0.12, color);
+            painter.circle_filled(Pos2::new(x + w * 0.64, y + h * 0.62), w * 0.12, color);
+        }
+        Icon::Videos => {
+            painter.rect_stroke(
+                Rect::from_min_max(
+                    Pos2::new(x + w * 0.08, y + h * 0.18),
+                    Pos2::new(x + w * 0.92, y + h * 0.82),
+                ),
+                egui::CornerRadius::same(2),
+                s,
+                egui::StrokeKind::Inside,
+            );
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    Pos2::new(x + w * 0.42, y + h * 0.34),
+                    Pos2::new(x + w * 0.42, y + h * 0.66),
+                    Pos2::new(x + w * 0.68, y + h * 0.5),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+        Icon::Drive => {
+            painter.rect_stroke(
+                Rect::from_min_max(
+                    Pos2::new(x + w * 0.08, y + h * 0.2),
+                    Pos2::new(x + w * 0.92, y + h * 0.8),
+                ),
+                egui::CornerRadius::same(3),
+                s,
+                egui::StrokeKind::Inside,
+            );
+            line(
+                Pos2::new(x + w * 0.2, y + h * 0.58),
+                Pos2::new(x + w * 0.8, y + h * 0.58),
+            );
+            painter.circle_filled(Pos2::new(x + w * 0.72, y + h * 0.7), w * 0.045, color);
+        }
     }
 }
 
@@ -785,11 +1288,7 @@ fn draw_file_row(
         egui::Stroke::new(1.0, Color32::from_rgb(39, 45, 56)),
     );
 
-    let name = if entry.is_dir {
-        format!("[Folder]  {}", entry.name)
-    } else {
-        format!("[File]  {}", entry.name)
-    };
+    let name = entry.name.clone();
     let file_type = if entry.is_dir {
         "Folder".to_owned()
     } else {
@@ -802,14 +1301,26 @@ fn draw_file_row(
     let modified = entry
         .modified
         .clone()
-        .map(|time| DateTime::<Local>::from(time).format("%Y-%m-%d %H:%M").to_string())
+        .map(|time| {
+            DateTime::<Local>::from(time)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
         .unwrap_or_else(|| "—".to_owned());
-    let text_color = if selected { Color32::WHITE } else { Color32::from_rgb(220, 225, 234) };
+    let text_color = if selected {
+        Color32::WHITE
+    } else {
+        Color32::from_rgb(220, 225, 234)
+    };
     let mut left = rect.left() + 10.0;
     for (index, (text, column_width)) in [
         name,
         file_type,
-        if entry.is_dir { "—".to_owned() } else { format_size(entry.size) },
+        if entry.is_dir {
+            "—".to_owned()
+        } else {
+            format_size(entry.size)
+        },
         modified,
     ]
     .into_iter()
@@ -820,13 +1331,37 @@ fn draw_file_row(
             Pos2::new(left, rect.top()),
             Pos2::new(left + column_width - 12.0, rect.bottom()),
         );
+        if index == 0 {
+            paint_icon(
+                ui.painter(),
+                if entry.is_dir {
+                    Icon::Folder
+                } else {
+                    Icon::File
+                },
+                Rect::from_min_size(
+                    Pos2::new(cell.left(), cell.center().y - 8.0),
+                    Vec2::splat(16.0),
+                ),
+                if selected {
+                    Color32::WHITE
+                } else if entry.is_dir {
+                    ACCENT
+                } else {
+                    MUTED
+                },
+            );
+        }
         let color = if index == 1 || index == 2 || index == 3 {
             if selected { text_color } else { MUTED }
         } else {
             text_color
         };
         ui.painter().with_clip_rect(cell).text(
-            Pos2::new(cell.left(), cell.center().y),
+            Pos2::new(
+                cell.left() + if index == 0 { 21.0 } else { 0.0 },
+                cell.center().y,
+            ),
             Align2::LEFT_CENTER,
             text,
             FontId::proportional(13.0),
