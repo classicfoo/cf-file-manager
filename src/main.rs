@@ -146,12 +146,21 @@ impl FileManagerApp {
             Err(error) => self.status = Some(format!("Could not open this folder: {error}")),
         }
 
-        entries.sort_by(|left, right| {
-            right
-                .is_dir
-                .cmp(&left.is_dir)
-                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-        });
+        if is_downloads_folder(&self.current_dir) {
+            entries.sort_by(|left, right| {
+                right
+                    .modified
+                    .cmp(&left.modified)
+                    .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            });
+        } else {
+            entries.sort_by(|left, right| {
+                right
+                    .is_dir
+                    .cmp(&left.is_dir)
+                    .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            });
+        }
         if self
             .selected
             .as_ref()
@@ -816,7 +825,7 @@ impl FileManagerApp {
                 ui.add_space(12.0);
 
                 let widths = column_widths(ui.available_width());
-                draw_table_header(ui, widths);
+                draw_table_header(ui, widths, is_downloads_folder(&self.current_dir));
                 ui.separator();
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1090,6 +1099,12 @@ fn home_dir() -> Option<PathBuf> {
     #[cfg(not(windows))]
     let home = env::var_os("HOME");
     home.map(PathBuf::from)
+}
+
+fn is_downloads_folder(path: &Path) -> bool {
+    home_dir()
+        .and_then(|home| fs::canonicalize(home.join("Downloads")).ok())
+        .is_some_and(|downloads| downloads == path)
 }
 
 fn pinned_folders_file() -> Result<PathBuf, String> {
@@ -1687,12 +1702,20 @@ fn column_widths(total: f32) -> [f32; 4] {
     [name, file_type, size, modified]
 }
 
-fn draw_table_header(ui: &mut egui::Ui, widths: [f32; 4]) {
+fn draw_table_header(ui: &mut egui::Ui, widths: [f32; 4], modified_descending: bool) {
     let width = widths.iter().sum();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 28.0), Sense::hover());
     let painter = ui.painter();
     let mut left = rect.left() + 10.0;
-    for (label, column_width) in ["Name", "Type", "Size", "Modified"].into_iter().zip(widths) {
+    let modified_label = if modified_descending {
+        "Modified ↓"
+    } else {
+        "Modified"
+    };
+    for (label, column_width) in ["Name", "Type", "Size", modified_label]
+        .into_iter()
+        .zip(widths)
+    {
         let cell = Rect::from_min_max(
             Pos2::new(left, rect.top()),
             Pos2::new(left + column_width - 12.0, rect.bottom()),
