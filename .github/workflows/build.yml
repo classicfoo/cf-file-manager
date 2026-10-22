@@ -20,4 +20,4 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libwayland-dev libegl1-mesa-dev libgles2-mesa-dev pkg-config
       - name: Build
-        run: cargo build --release
+        run: cargo build --locked --release

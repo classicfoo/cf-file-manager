@@ -17,7 +17,16 @@ A small desktop file manager written in Rust with [egui](https://www.egui.rs/). 
 
 ## Build and run
 
-Install the stable Rust toolchain first. On Linux, install the native windowing and OpenGL build dependencies:
+Install the stable Rust toolchain first, then clone this repository:
+
+```sh
+git clone https://github.com/classicfoo/cf-file-manager.git
+cd cf-file-manager
+```
+
+Cargo fetches the pinned `egui-classic95` library revision automatically, so the app does not need a second repository beside it.
+
+On Linux, install the native windowing and OpenGL build dependencies:
 
 ```sh
 sudo apt-get install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libwayland-dev libegl1-mesa-dev libgles2-mesa-dev pkg-config
@@ -26,13 +35,14 @@ sudo apt-get install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev lib
 Then build or run the app:
 
 ```sh
-cargo run --release
+cargo run --locked --release
 ```
 
-On Windows, build from a terminal with the Rust MSVC toolchain and Visual Studio C++ Build Tools installed:
+On Windows, use the Rust MSVC toolchain and Visual Studio C++ Build Tools. After updating an existing checkout, run:
 
 ```powershell
-cargo run --release
+git pull
+cargo run --locked --release
 ```
 
 The GitHub Actions workflow builds both Windows and Linux release binaries on every push and pull request.
