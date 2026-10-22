@@ -541,7 +541,7 @@ dependencies = [
 [[package]]
 name = "egui-classic95"
 version = "0.1.0"
-source = "git+https://github.com/classicfoo/egui-classic95.git?rev=b923f0d840518d8769ec7399f6102815a286e712#b923f0d840518d8769ec7399f6102815a286e712"
+source = "git+https://github.com/classicfoo/egui-classic95.git?branch=main#b923f0d840518d8769ec7399f6102815a286e712"
 dependencies = [
  "egui",
  "egui_system_font_provider",

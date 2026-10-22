@@ -24,7 +24,16 @@ git clone https://github.com/classicfoo/cf-file-manager.git
 cd cf-file-manager
 ```
 
-Cargo fetches the pinned `egui-classic95` library revision automatically, so the app does not need a second repository beside it.
+Cargo fetches `egui-classic95` from its `main` branch, so the app does not need a second repository beside it. `Cargo.lock` records the exact library commit used by normal builds.
+
+To refresh the app to the latest library commit, run:
+
+```sh
+cargo update -p egui-classic95
+cargo build --locked --release
+```
+
+Commit and push the updated `Cargo.lock` with the app changes. Other computers then get that same library revision with `git pull` and `cargo run --locked --release`.
 
 On Linux, install the native windowing and OpenGL build dependencies:
 
