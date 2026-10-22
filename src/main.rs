@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use std::time::{Duration, Instant};
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
@@ -75,6 +77,9 @@ struct FileManagerApp {
     dialog: Option<DialogKind>,
     dialog_input: String,
     focus_location: bool,
+    file_drop_target: Option<PathBuf>,
+    #[cfg(windows)]
+    pending_native_drag: Option<(PathBuf, Instant)>,
 }
 
 impl FileManagerApp {
@@ -106,6 +111,9 @@ impl FileManagerApp {
             dialog: None,
             dialog_input: String::new(),
             focus_location: false,
+            file_drop_target: None,
+            #[cfg(windows)]
+            pending_native_drag: None,
         };
         app.refresh();
         app
@@ -303,7 +311,7 @@ impl FileManagerApp {
         }
 
         let moving_directory = source.is_dir();
-        match fs::rename(source, &target) {
+        match move_path(source, &target) {
             Ok(()) => {
                 let mut pin_save_result = None;
                 if moving_directory {
@@ -334,7 +342,7 @@ impl FileManagerApp {
         }
     }
 
-    fn copy_dropped_items(&mut self, sources: &[PathBuf]) {
+    fn copy_dropped_items(&mut self, sources: &[PathBuf], destination_dir: &Path) {
         let mut copied = 0;
         let mut problems = Vec::new();
 
@@ -343,7 +351,7 @@ impl FileManagerApp {
                 problems.push(format!("{} has no file name", source.display()));
                 continue;
             };
-            let target = self.current_dir.join(name);
+            let target = destination_dir.join(name);
             if source == &target {
                 continue;
             }
@@ -353,7 +361,7 @@ impl FileManagerApp {
             }
 
             let canonical_source = fs::canonicalize(source).unwrap_or_else(|_| source.clone());
-            if canonical_source.is_dir() && self.current_dir.starts_with(&canonical_source) {
+            if canonical_source.is_dir() && destination_dir.starts_with(&canonical_source) {
                 problems.push(format!(
                     "{} cannot be copied into itself",
                     name.to_string_lossy()
@@ -379,14 +387,57 @@ impl FileManagerApp {
         self.refresh();
         self.status = Some(if problems.is_empty() {
             if copied == 1 {
-                "Copied 1 item into this folder.".to_owned()
+                "Copied 1 item into the drop folder.".to_owned()
             } else {
-                format!("Copied {copied} items into this folder.")
+                format!("Copied {copied} items into the drop folder.")
             }
         } else if copied == 0 {
             format!("Nothing copied: {}", problems.join("; "))
         } else {
             format!("Copied {copied} items. Skipped: {}", problems.join("; "))
+        });
+    }
+
+    #[cfg(windows)]
+    fn remove_dragged_source_after_move(&mut self, source: &Path) {
+        let is_directory = match fs::symlink_metadata(source) {
+            Ok(metadata) => metadata.is_dir(),
+            Err(error) => {
+                self.status = Some(format!("Could not finish moving the item: {error}"));
+                return;
+            }
+        };
+        let remove_result = if is_directory {
+            fs::remove_dir_all(source)
+        } else {
+            fs::remove_file(source)
+        };
+        if let Err(error) = remove_result {
+            self.status = Some(format!(
+                "The drop target accepted the move, but the source could not be removed: {error}"
+            ));
+            return;
+        }
+
+        let mut pin_save_result = None;
+        if is_directory {
+            let old_len = self.pinned_folders.len();
+            self.pinned_folders
+                .retain(|pinned| !pinned.starts_with(source));
+            if self.pinned_folders.len() != old_len {
+                pin_save_result = Some(self.persist_pinned_folders());
+            }
+        }
+        if self.selected.as_deref() == Some(source) {
+            self.selected = None;
+        }
+        self.refresh();
+        self.status = Some(match pin_save_result {
+            Some(Ok(())) => "Item moved to the drop target and removed from Pinned.".to_owned(),
+            Some(Err(error)) => {
+                format!("Item moved, but pinned folders could not be saved: {error}")
+            }
+            None => "Item moved to the drop target.".to_owned(),
         });
     }
 
@@ -795,9 +846,25 @@ impl FileManagerApp {
         let mut clicked_path = None;
         let mut opened_path = None;
         let mut pin_action = None;
-        let mut drop_action = None;
+        #[cfg(not(windows))]
+        let mut drop_action: Option<(PathBuf, PathBuf)> = None;
         #[cfg(windows)]
-        let mut external_drag_result = None;
+        let mut native_drag_result = None;
+        let (hovering_dropped_files, dropped_files, pointer_pos) = ui.ctx().input(|input| {
+            (
+                !input.raw.hovered_files.is_empty(),
+                input
+                    .raw
+                    .dropped_files
+                    .iter()
+                    .map(|file| file.path().to_path_buf())
+                    .collect::<Vec<_>>(),
+                input.pointer.hover_pos(),
+            )
+        });
+        let file_drop_active = hovering_dropped_files || !dropped_files.is_empty();
+        let mut file_drop_hover_target = None;
+        let current_dir = self.current_dir.clone();
         let entries = self.filtered_entries();
         let selected = self.selected.clone();
 
@@ -824,8 +891,8 @@ impl FileManagerApp {
                         .small()
                         .color(MUTED),
                 );
-                if ui.input(|input| !input.raw.hovered_files.is_empty()) {
-                    ui.colored_label(ACCENT, "Drop files to copy them into this folder");
+                if file_drop_active {
+                    ui.colored_label(ACCENT, "Drop onto a folder or here to place items");
                 }
                 ui.add_space(12.0);
 
@@ -853,14 +920,11 @@ impl FileManagerApp {
                         let response = draw_file_row(ui, entry, is_selected, widths);
                         #[cfg(windows)]
                         {
-                            let ctrl_down = ui.input(|input| input.modifiers.ctrl);
-                            let drag_out =
-                                response.drag_started_by(egui::PointerButton::Primary) && ctrl_down;
-                            if drag_out {
-                                external_drag_result =
-                                    Some(windows_file_drag::drag_path(&entry.path));
-                            } else if !ctrl_down {
-                                response.dnd_set_drag_payload(entry.path.clone());
+                            if response.drag_started_by(egui::PointerButton::Primary) {
+                                native_drag_result = Some((
+                                    entry.path.clone(),
+                                    windows_file_drag::drag_path(&entry.path),
+                                ));
                             }
                         }
                         #[cfg(not(windows))]
@@ -872,6 +936,19 @@ impl FileManagerApp {
                             opened_path = Some(entry.path.clone());
                         }
                         if entry.is_dir {
+                            let pointer_is_over_row = response.hovered()
+                                || pointer_pos
+                                    .is_some_and(|position| response.rect.contains(position));
+                            if file_drop_active && pointer_is_over_row {
+                                file_drop_hover_target = Some(entry.path.clone());
+                                ui.painter().rect_stroke(
+                                    response.rect,
+                                    egui::CornerRadius::same(5),
+                                    egui::Stroke::new(2.0, ACCENT),
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
+                            #[cfg(not(windows))]
                             if response.dnd_hover_payload::<PathBuf>().is_some() {
                                 ui.painter().rect_stroke(
                                     response.rect,
@@ -880,6 +957,7 @@ impl FileManagerApp {
                                     egui::StrokeKind::Inside,
                                 );
                             }
+                            #[cfg(not(windows))]
                             if let Some(source) = response.dnd_release_payload::<PathBuf>() {
                                 drop_action = Some((source.as_ref().clone(), entry.path.clone()));
                             }
@@ -900,8 +978,15 @@ impl FileManagerApp {
                         }
                     }
                 });
+                if file_drop_active
+                    && file_drop_hover_target.is_none()
+                    && current_folder_drop_target.hovered()
+                {
+                    file_drop_hover_target = Some(current_dir.clone());
+                }
+                #[cfg(not(windows))]
                 if let Some(source) = current_folder_drop_target.dnd_release_payload::<PathBuf>() {
-                    drop_action = Some((source.as_ref().clone(), self.current_dir.clone()));
+                    drop_action = Some((source.as_ref().clone(), current_dir.clone()));
                 }
             });
 
@@ -924,16 +1009,58 @@ impl FileManagerApp {
                 self.pin_folder(&path);
             }
         }
+        #[cfg(not(windows))]
         if let Some((source, destination)) = drop_action {
             self.move_item_to(&source, &destination);
         }
         #[cfg(windows)]
-        if let Some(result) = external_drag_result {
-            self.status = Some(match result {
-                Ok(true) => "Dropped into another app.".to_owned(),
-                Ok(false) => "External drag canceled.".to_owned(),
-                Err(error) => format!("Could not start external drag: {error}"),
-            });
+        if let Some((source, result)) = native_drag_result {
+            match result {
+                Ok(Some(windows_file_drag::DragEffect::Copy)) => {
+                    self.pending_native_drag = Some((source, Instant::now()));
+                    self.status = Some("Item copied to the drop target.".to_owned());
+                }
+                Ok(Some(windows_file_drag::DragEffect::Move)) => {
+                    self.pending_native_drag = Some((source.clone(), Instant::now()));
+                    self.remove_dragged_source_after_move(&source);
+                }
+                Ok(None) => self.status = Some("Drag canceled.".to_owned()),
+                Err(error) => self.status = Some(format!("Could not start drag: {error}")),
+            }
+        }
+
+        if !dropped_files.is_empty() {
+            let destination = file_drop_hover_target
+                .or_else(|| self.file_drop_target.clone())
+                .unwrap_or_else(|| self.current_dir.clone());
+            self.file_drop_target = None;
+
+            #[cfg(windows)]
+            let pending_source = self
+                .pending_native_drag
+                .take()
+                .filter(|(_, started)| started.elapsed() < Duration::from_secs(5))
+                .map(|(path, _)| path);
+
+            let mut files_to_copy = Vec::new();
+            for source in dropped_files {
+                #[cfg(windows)]
+                if pending_source
+                    .as_ref()
+                    .is_some_and(|pending| same_filesystem_path(pending, &source))
+                {
+                    self.move_item_to(&source, &destination);
+                    continue;
+                }
+                files_to_copy.push(source);
+            }
+            if !files_to_copy.is_empty() {
+                self.copy_dropped_items(&files_to_copy, &destination);
+            }
+        } else if hovering_dropped_files {
+            self.file_drop_target = file_drop_hover_target;
+        } else {
+            self.file_drop_target = None;
         }
     }
 
@@ -1064,17 +1191,6 @@ impl FileManagerApp {
 impl eframe::App for FileManagerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        let dropped_files = ctx.input(|input| {
-            input
-                .raw
-                .dropped_files
-                .iter()
-                .map(|file| file.path().to_path_buf())
-                .collect::<Vec<_>>()
-        });
-        if !dropped_files.is_empty() {
-            self.copy_dropped_items(&dropped_files);
-        }
         let shortcuts_enabled = !ctx.egui_wants_keyboard_input();
         if shortcuts_enabled {
             let (back, forward, refresh, focus_location, new_folder, delete) = ctx.input(|input| {
@@ -1234,6 +1350,64 @@ fn copy_item(source: &Path, destination: &Path) -> io::Result<()> {
         fs::copy(source, destination)?;
     }
     Ok(())
+}
+
+fn move_path(source: &Path, destination: &Path) -> io::Result<()> {
+    match fs::rename(source, destination) {
+        Ok(()) => Ok(()),
+        Err(error) if is_cross_device_error(&error) => {
+            if let Err(copy_error) = copy_item(source, destination) {
+                remove_path_if_present(destination);
+                return Err(copy_error);
+            }
+            if let Err(remove_error) = remove_path(source) {
+                remove_path_if_present(destination);
+                return Err(remove_error);
+            }
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_path(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+fn remove_path_if_present(path: &Path) {
+    if fs::symlink_metadata(path).is_ok() {
+        let _ = remove_path(path);
+    }
+}
+
+fn is_cross_device_error(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        error.raw_os_error() == Some(17) // ERROR_NOT_SAME_DEVICE
+    }
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(18) // EXDEV
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+#[cfg(windows)]
+fn same_filesystem_path(left: &Path, right: &Path) -> bool {
+    left == right
+        || fs::canonicalize(left)
+            .ok()
+            .zip(fs::canonicalize(right).ok())
+            .is_some_and(|(left, right)| left == right)
 }
 
 fn standard_places(home: &Path) -> Vec<(&'static str, PathBuf)> {
@@ -1869,7 +2043,7 @@ fn draw_file_row(
         "Double-click to open".to_owned()
     };
     #[cfg(windows)]
-    hint.push_str("\nCtrl+drag to drop into another app.");
+    hint.push_str("\nDrag to a folder to move, or to another app.");
     response.on_hover_text(hint)
 }
 

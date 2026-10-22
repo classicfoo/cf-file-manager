@@ -22,7 +22,10 @@ use windows_sys::{
                 STGMEDIUM_0, TYMED_HGLOBAL,
             },
             Memory::{GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalUnlock},
-            Ole::{CF_HDROP, DROPEFFECT_COPY, DoDragDrop, OleInitialize, OleUninitialize},
+            Ole::{
+                CF_HDROP, DROPEFFECT_COPY, DROPEFFECT_MOVE, DoDragDrop, OleInitialize,
+                OleUninitialize,
+            },
         },
     },
     core::{GUID, HRESULT},
@@ -33,6 +36,11 @@ const IID_IDATAOBJECT: GUID = GUID::from_u128(0x0000010e_0000_0000_c000_00000000
 const IID_IENUMFORMATETC: GUID = GUID::from_u128(0x00000103_0000_0000_c000_000000000046);
 const IID_IDROPSOURCE: GUID = GUID::from_u128(0x00000121_0000_0000_c000_000000000046);
 const MK_LBUTTON: u32 = 0x0001;
+
+pub(super) enum DragEffect {
+    Copy,
+    Move,
+}
 
 #[repr(C)]
 struct DataObjectVTable {
@@ -141,7 +149,7 @@ static ENUM_FORMATETC_VTABLE: EnumFormatEtcVTable = EnumFormatEtcVTable {
     Clone: enum_clone,
 };
 
-pub(super) fn drag_path(path: &Path) -> Result<bool, String> {
+pub(super) fn drag_path(path: &Path) -> Result<Option<DragEffect>, String> {
     let mut wide_path = path.as_os_str().encode_wide().collect::<Vec<_>>();
     wide_path.push(0);
     wide_path.push(0);
@@ -173,7 +181,7 @@ pub(super) fn drag_path(path: &Path) -> Result<bool, String> {
         DoDragDrop(
             data_object as IDataObject,
             drop_source,
-            DROPEFFECT_COPY,
+            DROPEFFECT_COPY | DROPEFFECT_MOVE,
             &mut effect,
         )
     };
@@ -184,13 +192,14 @@ pub(super) fn drag_path(path: &Path) -> Result<bool, String> {
     }
 
     match result {
-        DRAGDROP_S_DROP => Ok(effect & DROPEFFECT_COPY != 0),
-        DRAGDROP_S_CANCEL => Ok(false),
+        DRAGDROP_S_DROP if effect & DROPEFFECT_MOVE != 0 => Ok(Some(DragEffect::Move)),
+        DRAGDROP_S_DROP if effect & DROPEFFECT_COPY != 0 => Ok(Some(DragEffect::Copy)),
+        DRAGDROP_S_DROP | DRAGDROP_S_CANCEL => Ok(None),
         error if error < 0 => Err(format!(
             "Windows drag operation failed (0x{:08X})",
             error as u32
         )),
-        _ => Ok(effect & DROPEFFECT_COPY != 0),
+        _ => Ok(None),
     }
 }
 
