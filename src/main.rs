@@ -1,5 +1,5 @@
 use std::{
-    env, fs,
+    env, fs, io,
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -22,7 +22,8 @@ fn main() -> eframe::Result {
             .with_app_id("cf-file-manager")
             .with_icon(app_icon)
             .with_inner_size([1120.0, 740.0])
-            .with_min_inner_size([780.0, 520.0]),
+            .with_min_inner_size([780.0, 520.0])
+            .with_drag_and_drop(true),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
@@ -263,6 +264,118 @@ impl FileManagerApp {
             fs::write(file, contents)
                 .map_err(|error| format!("Could not save pinned folders: {error}"))
         })
+    }
+
+    fn move_item_to(&mut self, source: &Path, destination_dir: &Path) {
+        if !destination_dir.is_dir() {
+            self.status = Some("Drop items onto a folder.".to_owned());
+            return;
+        }
+        if source.parent() == Some(destination_dir) {
+            self.status = Some("This item is already in that folder.".to_owned());
+            return;
+        }
+        if source.is_dir() && destination_dir.starts_with(source) {
+            self.status = Some("A folder cannot be moved inside itself.".to_owned());
+            return;
+        }
+
+        let Some(name) = source.file_name() else {
+            self.status = Some("This item cannot be moved.".to_owned());
+            return;
+        };
+        let target = destination_dir.join(name);
+        if fs::symlink_metadata(&target).is_ok() {
+            self.status = Some(format!("{} already exists there.", name.to_string_lossy()));
+            return;
+        }
+
+        let moving_directory = source.is_dir();
+        match fs::rename(source, &target) {
+            Ok(()) => {
+                let mut pin_save_result = None;
+                if moving_directory {
+                    let mut changed_pins = false;
+                    for pinned in &mut self.pinned_folders {
+                        if let Ok(relative) = pinned.strip_prefix(source) {
+                            *pinned = target.join(relative);
+                            changed_pins = true;
+                        }
+                    }
+                    if changed_pins {
+                        pin_save_result = Some(self.persist_pinned_folders());
+                    }
+                }
+                if self.selected.as_deref() == Some(source) {
+                    self.selected = Some(target);
+                }
+                self.refresh();
+                self.status = Some(match pin_save_result {
+                    Some(Ok(())) => "Item moved and pinned paths updated.".to_owned(),
+                    Some(Err(error)) => {
+                        format!("Item moved, but pinned paths could not be saved: {error}")
+                    }
+                    None => "Item moved.".to_owned(),
+                });
+            }
+            Err(error) => self.status = Some(format!("Could not move item: {error}")),
+        }
+    }
+
+    fn copy_dropped_items(&mut self, sources: &[PathBuf]) {
+        let mut copied = 0;
+        let mut problems = Vec::new();
+
+        for source in sources {
+            let Some(name) = source.file_name() else {
+                problems.push(format!("{} has no file name", source.display()));
+                continue;
+            };
+            let target = self.current_dir.join(name);
+            if source == &target {
+                continue;
+            }
+            if fs::symlink_metadata(&target).is_ok() {
+                problems.push(format!("{} already exists", name.to_string_lossy()));
+                continue;
+            }
+
+            let canonical_source = fs::canonicalize(source).unwrap_or_else(|_| source.clone());
+            if canonical_source.is_dir() && self.current_dir.starts_with(&canonical_source) {
+                problems.push(format!(
+                    "{} cannot be copied into itself",
+                    name.to_string_lossy()
+                ));
+                continue;
+            }
+
+            match copy_item(source, &target) {
+                Ok(()) => copied += 1,
+                Err(error) => {
+                    if fs::symlink_metadata(&target).is_ok() {
+                        let _ = if target.is_dir() {
+                            fs::remove_dir_all(&target)
+                        } else {
+                            fs::remove_file(&target)
+                        };
+                    }
+                    problems.push(format!("{}: {error}", name.to_string_lossy()));
+                }
+            }
+        }
+
+        self.refresh();
+        self.status = Some(if problems.is_empty() {
+            if copied == 1 {
+                "Copied 1 item into this folder.".to_owned()
+            } else {
+                format!("Copied {copied} items into this folder.")
+            }
+        } else if copied == 0 {
+            format!("Nothing copied: {}", problems.join("; "))
+        } else {
+            format!("Copied {copied} items. Skipped: {}", problems.join("; "))
+        });
     }
 
     fn open_selected(&mut self) {
@@ -670,6 +783,7 @@ impl FileManagerApp {
         let mut clicked_path = None;
         let mut opened_path = None;
         let mut pin_action = None;
+        let mut drop_action = None;
         let entries = self.filtered_entries();
         let selected = self.selected.clone();
 
@@ -680,6 +794,11 @@ impl FileManagerApp {
                     .inner_margin(egui::Margin::symmetric(18, 14)),
             )
             .show(ui, |ui| {
+                let current_folder_drop_target = ui.interact(
+                    ui.max_rect(),
+                    egui::Id::new("current_folder_drop_target"),
+                    Sense::hover(),
+                );
                 let folder_name = self
                     .current_dir
                     .file_name()
@@ -691,6 +810,9 @@ impl FileManagerApp {
                         .small()
                         .color(MUTED),
                 );
+                if ui.input(|input| !input.raw.hovered_files.is_empty()) {
+                    ui.colored_label(ACCENT, "Drop files to copy them into this folder");
+                }
                 ui.add_space(12.0);
 
                 let widths = column_widths(ui.available_width());
@@ -715,11 +837,25 @@ impl FileManagerApp {
                     for entry in &entries {
                         let is_selected = selected.as_ref() == Some(&entry.path);
                         let response = draw_file_row(ui, entry, is_selected, widths);
+                        response.dnd_set_drag_payload(entry.path.clone());
                         if response.clicked() {
                             clicked_path = Some(entry.path.clone());
                         }
                         if response.double_clicked() {
                             opened_path = Some(entry.path.clone());
+                        }
+                        if entry.is_dir {
+                            if response.dnd_hover_payload::<PathBuf>().is_some() {
+                                ui.painter().rect_stroke(
+                                    response.rect,
+                                    egui::CornerRadius::same(5),
+                                    egui::Stroke::new(2.0, ACCENT),
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
+                            if let Some(source) = response.dnd_release_payload::<PathBuf>() {
+                                drop_action = Some((source.as_ref().clone(), entry.path.clone()));
+                            }
                         }
                         if entry.is_dir {
                             response.context_menu(|ui| {
@@ -737,6 +873,9 @@ impl FileManagerApp {
                         }
                     }
                 });
+                if let Some(source) = current_folder_drop_target.dnd_release_payload::<PathBuf>() {
+                    drop_action = Some((source.as_ref().clone(), self.current_dir.clone()));
+                }
             });
 
         if let Some(path) = clicked_path {
@@ -757,6 +896,9 @@ impl FileManagerApp {
             } else {
                 self.pin_folder(&path);
             }
+        }
+        if let Some((source, destination)) = drop_action {
+            self.move_item_to(&source, &destination);
         }
     }
 
@@ -887,6 +1029,17 @@ impl FileManagerApp {
 impl eframe::App for FileManagerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let dropped_files = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path().to_path_buf())
+                .collect::<Vec<_>>()
+        });
+        if !dropped_files.is_empty() {
+            self.copy_dropped_items(&dropped_files);
+        }
         let shortcuts_enabled = !ctx.egui_wants_keyboard_input();
         if shortcuts_enabled {
             let (back, forward, refresh, focus_location, new_folder, delete) = ctx.input(|input| {
@@ -1019,6 +1172,27 @@ fn unescape_config_path(path: &str) -> String {
         }
     }
     unescaped
+}
+
+fn copy_item(source: &Path, destination: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "symbolic links cannot be copied by dropping them",
+        ));
+    }
+
+    if metadata.is_dir() {
+        fs::create_dir(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            copy_item(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+    } else {
+        fs::copy(source, destination)?;
+    }
+    Ok(())
 }
 
 fn standard_places(home: &Path) -> Vec<(&'static str, PathBuf)> {
@@ -1541,7 +1715,8 @@ fn draw_file_row(
     widths: [f32; 4],
 ) -> egui::Response {
     let total_width = widths.iter().sum();
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(total_width, 34.0), Sense::click());
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(total_width, 34.0), Sense::click_and_drag());
     let fill = if selected {
         Color32::from_rgb(41, 73, 117)
     } else if response.hovered() {
