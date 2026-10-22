@@ -398,49 +398,6 @@ impl FileManagerApp {
         });
     }
 
-    #[cfg(windows)]
-    fn remove_dragged_source_after_move(&mut self, source: &Path) {
-        let is_directory = match fs::symlink_metadata(source) {
-            Ok(metadata) => metadata.is_dir(),
-            Err(error) => {
-                self.status = Some(format!("Could not finish moving the item: {error}"));
-                return;
-            }
-        };
-        let remove_result = if is_directory {
-            fs::remove_dir_all(source)
-        } else {
-            fs::remove_file(source)
-        };
-        if let Err(error) = remove_result {
-            self.status = Some(format!(
-                "The drop target accepted the move, but the source could not be removed: {error}"
-            ));
-            return;
-        }
-
-        let mut pin_save_result = None;
-        if is_directory {
-            let old_len = self.pinned_folders.len();
-            self.pinned_folders
-                .retain(|pinned| !pinned.starts_with(source));
-            if self.pinned_folders.len() != old_len {
-                pin_save_result = Some(self.persist_pinned_folders());
-            }
-        }
-        if self.selected.as_deref() == Some(source) {
-            self.selected = None;
-        }
-        self.refresh();
-        self.status = Some(match pin_save_result {
-            Some(Ok(())) => "Item moved to the drop target and removed from Pinned.".to_owned(),
-            Some(Err(error)) => {
-                format!("Item moved, but pinned folders could not be saved: {error}")
-            }
-            None => "Item moved to the drop target.".to_owned(),
-        });
-    }
-
     fn open_selected(&mut self) {
         let Some(path) = self.selected.clone() else {
             return;
@@ -843,6 +800,15 @@ impl FileManagerApp {
     }
 
     fn show_file_list(&mut self, ui: &mut egui::Ui) {
+        #[cfg(windows)]
+        if self
+            .pending_native_drag
+            .as_ref()
+            .is_some_and(|(_, started)| started.elapsed() >= Duration::from_secs(5))
+        {
+            self.pending_native_drag = None;
+        }
+
         let mut clicked_path = None;
         let mut opened_path = None;
         let mut pin_action = None;
@@ -862,7 +828,12 @@ impl FileManagerApp {
                 input.pointer.hover_pos(),
             )
         });
-        let file_drop_active = hovering_dropped_files || !dropped_files.is_empty();
+        #[cfg(windows)]
+        let native_drag_active = self.pending_native_drag.is_some();
+        #[cfg(not(windows))]
+        let native_drag_active = false;
+        let file_drop_active =
+            hovering_dropped_files || !dropped_files.is_empty() || native_drag_active;
         let mut file_drop_hover_target = None;
         let current_dir = self.current_dir.clone();
         let entries = self.filtered_entries();
@@ -1016,15 +987,10 @@ impl FileManagerApp {
         #[cfg(windows)]
         if let Some((source, result)) = native_drag_result {
             match result {
-                Ok(Some(windows_file_drag::DragEffect::Copy)) => {
+                Ok(true) => {
                     self.pending_native_drag = Some((source, Instant::now()));
-                    self.status = Some("Item copied to the drop target.".to_owned());
                 }
-                Ok(Some(windows_file_drag::DragEffect::Move)) => {
-                    self.pending_native_drag = Some((source.clone(), Instant::now()));
-                    self.remove_dragged_source_after_move(&source);
-                }
-                Ok(None) => self.status = Some("Drag canceled.".to_owned()),
+                Ok(false) => self.status = Some("Drag canceled.".to_owned()),
                 Err(error) => self.status = Some(format!("Could not start drag: {error}")),
             }
         }

@@ -1,11 +1,13 @@
 #![allow(non_snake_case)]
 
 use std::{
+    collections::HashMap,
     ffi::c_void,
     mem::{size_of, zeroed},
     os::windows::ffi::OsStrExt,
     path::Path,
     ptr::{copy_nonoverlapping, null, null_mut},
+    sync::Mutex,
     sync::atomic::{AtomicU32, Ordering},
 };
 
@@ -13,19 +15,25 @@ use windows_sys::{
     Win32::{
         Foundation::{
             DATA_S_SAMEFORMATETC, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS,
-            DV_E_FORMATETC, E_NOINTERFACE, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER, GlobalFree,
-            OLE_E_ADVISENOTSUPPORTED, S_FALSE, S_OK,
+            DV_E_FORMATETC, DV_E_TYMED, E_NOINTERFACE, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER,
+            GlobalFree, OLE_E_ADVISENOTSUPPORTED, S_FALSE, S_OK,
         },
         System::{
             Com::{
                 DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IDataObject, IEnumFORMATETC, STGMEDIUM,
                 STGMEDIUM_0, TYMED_HGLOBAL,
             },
-            Memory::{GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalUnlock},
-            Ole::{
-                CF_HDROP, DROPEFFECT_COPY, DROPEFFECT_MOVE, DoDragDrop, OleInitialize,
-                OleUninitialize,
+            DataExchange::RegisterClipboardFormatW,
+            Memory::{
+                GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
             },
+            Ole::{
+                CF_HDROP, DROPEFFECT_COPY, DoDragDrop, OleInitialize, OleUninitialize,
+                ReleaseStgMedium,
+            },
+        },
+        UI::Shell::{
+            CFSTR_LOGICALPERFORMEDDROPEFFECT, CFSTR_PERFORMEDDROPEFFECT, CFSTR_PREFERREDDROPEFFECT,
         },
     },
     core::{GUID, HRESULT},
@@ -36,11 +44,6 @@ const IID_IDATAOBJECT: GUID = GUID::from_u128(0x0000010e_0000_0000_c000_00000000
 const IID_IENUMFORMATETC: GUID = GUID::from_u128(0x00000103_0000_0000_c000_000000000046);
 const IID_IDROPSOURCE: GUID = GUID::from_u128(0x00000121_0000_0000_c000_000000000046);
 const MK_LBUTTON: u32 = 0x0001;
-
-pub(super) enum DragEffect {
-    Copy,
-    Move,
-}
 
 #[repr(C)]
 struct DataObjectVTable {
@@ -79,6 +82,9 @@ struct DataObject {
     vtable: *const DataObjectVTable,
     references: AtomicU32,
     paths: Vec<u16>,
+    preferred_drop_effect_format: u16,
+    outcome_formats: [u16; 2],
+    outcome_data: Mutex<HashMap<u16, Vec<u8>>>,
 }
 
 #[repr(C)]
@@ -113,6 +119,7 @@ struct EnumFormatEtcVTable {
 struct FormatEnumerator {
     vtable: *const EnumFormatEtcVTable,
     references: AtomicU32,
+    formats: Vec<FORMATETC>,
     index: u32,
 }
 
@@ -149,7 +156,12 @@ static ENUM_FORMATETC_VTABLE: EnumFormatEtcVTable = EnumFormatEtcVTable {
     Clone: enum_clone,
 };
 
-pub(super) fn drag_path(path: &Path) -> Result<Option<DragEffect>, String> {
+pub(super) fn drag_path(path: &Path) -> Result<bool, String> {
+    let preferred_drop_effect_format = register_clipboard_format(CFSTR_PREFERREDDROPEFFECT)?;
+    let outcome_formats = [
+        register_clipboard_format(CFSTR_PERFORMEDDROPEFFECT)?,
+        register_clipboard_format(CFSTR_LOGICALPERFORMEDDROPEFFECT)?,
+    ];
     let mut wide_path = path.as_os_str().encode_wide().collect::<Vec<_>>();
     wide_path.push(0);
     wide_path.push(0);
@@ -158,6 +170,9 @@ pub(super) fn drag_path(path: &Path) -> Result<Option<DragEffect>, String> {
         vtable: &DATA_OBJECT_VTABLE,
         references: AtomicU32::new(1),
         paths: wide_path,
+        preferred_drop_effect_format,
+        outcome_formats,
+        outcome_data: Mutex::new(HashMap::new()),
     })) as *mut c_void;
     let drop_source = Box::into_raw(Box::new(DropSource {
         vtable: &DROP_SOURCE_VTABLE,
@@ -181,7 +196,7 @@ pub(super) fn drag_path(path: &Path) -> Result<Option<DragEffect>, String> {
         DoDragDrop(
             data_object as IDataObject,
             drop_source,
-            DROPEFFECT_COPY | DROPEFFECT_MOVE,
+            DROPEFFECT_COPY,
             &mut effect,
         )
     };
@@ -192,26 +207,44 @@ pub(super) fn drag_path(path: &Path) -> Result<Option<DragEffect>, String> {
     }
 
     match result {
-        DRAGDROP_S_DROP if effect & DROPEFFECT_MOVE != 0 => Ok(Some(DragEffect::Move)),
-        DRAGDROP_S_DROP if effect & DROPEFFECT_COPY != 0 => Ok(Some(DragEffect::Copy)),
-        DRAGDROP_S_DROP | DRAGDROP_S_CANCEL => Ok(None),
+        DRAGDROP_S_DROP if effect & DROPEFFECT_COPY != 0 => Ok(true),
+        DRAGDROP_S_DROP | DRAGDROP_S_CANCEL => Ok(false),
         error if error < 0 => Err(format!(
             "Windows drag operation failed (0x{:08X})",
             error as u32
         )),
-        _ => Ok(None),
+        _ => Ok(false),
     }
 }
 
-fn supported_format(format: *const FORMATETC) -> HRESULT {
+fn register_clipboard_format(name: windows_sys::core::PCWSTR) -> Result<u16, String> {
+    let format = unsafe { RegisterClipboardFormatW(name) };
+    if format == 0 {
+        Err("Windows could not register a drag-and-drop format.".to_owned())
+    } else {
+        Ok(format as u16)
+    }
+}
+
+fn supported_format(format: *const FORMATETC, object: &DataObject) -> HRESULT {
     if format.is_null() {
         return E_POINTER;
     }
     let format = unsafe { &*format };
-    if format.cfFormat == CF_HDROP
-        && format.dwAspect == DVASPECT_CONTENT
-        && format.lindex == -1
-        && format.tymed & TYMED_HGLOBAL as u32 != 0
+    if format.dwAspect != DVASPECT_CONTENT || format.lindex != -1 {
+        return DV_E_FORMATETC;
+    }
+    if format.tymed & TYMED_HGLOBAL as u32 == 0 {
+        return DV_E_TYMED;
+    }
+    if format.cfFormat == CF_HDROP || format.cfFormat == object.preferred_drop_effect_format {
+        return S_OK;
+    }
+    if object
+        .outcome_data
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains_key(&format.cfFormat)
     {
         S_OK
     } else {
@@ -258,20 +291,38 @@ unsafe extern "system" fn data_get(
     if medium.is_null() {
         return E_POINTER;
     }
-    let validation = supported_format(format);
+    if this.is_null() {
+        return E_POINTER;
+    }
+    let object = unsafe { &*(this as *mut DataObject) };
+    let validation = supported_format(format, object);
     if validation != S_OK {
         return validation;
     }
 
-    let object = unsafe { &*(this as *mut DataObject) };
-    let header_size = size_of::<windows_sys::Win32::UI::Shell::DROPFILES>();
-    let mut bytes = vec![0u8; header_size + object.paths.len() * size_of::<u16>()];
-    bytes[0..4].copy_from_slice(&(header_size as u32).to_le_bytes());
-    bytes[16..20].copy_from_slice(&1i32.to_le_bytes());
-    for (index, character) in object.paths.iter().copied().enumerate() {
-        let offset = header_size + index * size_of::<u16>();
-        bytes[offset..offset + 2].copy_from_slice(&character.to_le_bytes());
-    }
+    let format = unsafe { &*format };
+    let bytes = if format.cfFormat == CF_HDROP {
+        let header_size = size_of::<windows_sys::Win32::UI::Shell::DROPFILES>();
+        let mut bytes = vec![0u8; header_size + object.paths.len() * size_of::<u16>()];
+        bytes[0..4].copy_from_slice(&(header_size as u32).to_le_bytes());
+        bytes[16..20].copy_from_slice(&1i32.to_le_bytes());
+        for (index, character) in object.paths.iter().copied().enumerate() {
+            let offset = header_size + index * size_of::<u16>();
+            bytes[offset..offset + 2].copy_from_slice(&character.to_le_bytes());
+        }
+        bytes
+    } else if format.cfFormat == object.preferred_drop_effect_format {
+        DROPEFFECT_COPY.to_le_bytes().to_vec()
+    } else {
+        let outcome_data = object
+            .outcome_data
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(bytes) = outcome_data.get(&format.cfFormat) else {
+            return DV_E_FORMATETC;
+        };
+        bytes.clone()
+    };
 
     let global = unsafe { GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes.len()) };
     if global.is_null() {
@@ -301,10 +352,14 @@ unsafe extern "system" fn data_get_here(
 }
 
 unsafe extern "system" fn data_query_get(
-    _this: *mut IDataObject,
+    this: *mut IDataObject,
     format: *const FORMATETC,
 ) -> HRESULT {
-    supported_format(format)
+    if this.is_null() {
+        return E_POINTER;
+    }
+    let object = unsafe { &*(this as *mut DataObject) };
+    supported_format(format, object)
 }
 
 unsafe extern "system" fn data_get_canonical(
@@ -323,29 +378,86 @@ unsafe extern "system" fn data_get_canonical(
 }
 
 unsafe extern "system" fn data_set(
-    _this: *mut IDataObject,
-    _format: *const FORMATETC,
-    _medium: *const STGMEDIUM,
-    _release: i32,
+    this: *mut IDataObject,
+    format: *const FORMATETC,
+    medium: *const STGMEDIUM,
+    release: i32,
 ) -> HRESULT {
-    E_NOTIMPL
+    if this.is_null() || format.is_null() || medium.is_null() {
+        return E_POINTER;
+    }
+    let object = unsafe { &*(this as *mut DataObject) };
+    let format = unsafe { &*format };
+    let medium = unsafe { &*medium };
+    if format.cfFormat == CF_HDROP
+        || format.cfFormat == object.preferred_drop_effect_format
+        || format.dwAspect != DVASPECT_CONTENT
+        || format.lindex != -1
+    {
+        return E_NOTIMPL;
+    }
+    if format.tymed & TYMED_HGLOBAL as u32 == 0 || medium.tymed != TYMED_HGLOBAL as u32 {
+        return DV_E_TYMED;
+    }
+
+    let handle = unsafe { medium.u.hGlobal };
+    let length = unsafe { GlobalSize(handle) };
+    let locked = unsafe { GlobalLock(handle) };
+    if locked.is_null() {
+        return E_OUTOFMEMORY;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(locked.cast::<u8>(), length) }.to_vec();
+    unsafe { GlobalUnlock(handle) };
+    object
+        .outcome_data
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(format.cfFormat, bytes);
+    if release != 0 {
+        unsafe { ReleaseStgMedium(medium as *const STGMEDIUM as *mut STGMEDIUM) };
+    }
+    S_OK
 }
 
 unsafe extern "system" fn data_enum_format(
-    _this: *mut IDataObject,
+    this: *mut IDataObject,
     direction: u32,
     output: *mut *mut IEnumFORMATETC,
 ) -> HRESULT {
-    if output.is_null() {
+    if output.is_null() || this.is_null() {
         return E_POINTER;
     }
     unsafe { *output = null_mut() };
-    if direction != DATADIR_GET as u32 {
-        return E_NOTIMPL;
-    }
+    let object = unsafe { &*(this as *mut DataObject) };
+    let formats = match direction {
+        direction if direction == DATADIR_GET as u32 => {
+            let mut formats = vec![
+                file_drop_format(),
+                global_memory_format(object.preferred_drop_effect_format),
+            ];
+            let outcome_data = object
+                .outcome_data
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            formats.extend(
+                outcome_data
+                    .keys()
+                    .map(|format| global_memory_format(*format)),
+            );
+            formats
+        }
+        direction if direction == windows_sys::Win32::System::Com::DATADIR_SET as u32 => object
+            .outcome_formats
+            .iter()
+            .copied()
+            .map(global_memory_format)
+            .collect(),
+        _ => return E_NOTIMPL,
+    };
     let enumerator = Box::new(FormatEnumerator {
         vtable: &ENUM_FORMATETC_VTABLE,
         references: AtomicU32::new(1),
+        formats,
         index: 0,
     });
     unsafe { *output = Box::into_raw(enumerator) as *mut IEnumFORMATETC };
@@ -469,13 +581,11 @@ unsafe extern "system" fn enum_next(
         return E_POINTER;
     }
     let object = unsafe { &mut *(this as *mut FormatEnumerator) };
-    let available = u32::from(object.index == 0);
-    let copied = count.min(available);
-    if copied == 1 {
-        unsafe {
-            *output = file_drop_format();
-            object.index = 1;
-        }
+    let mut copied = 0;
+    while copied < count && object.index < object.formats.len() as u32 {
+        unsafe { *output.add(copied as usize) = object.formats[object.index as usize] };
+        object.index += 1;
+        copied += 1;
     }
     if !fetched.is_null() {
         unsafe { *fetched = copied };
@@ -485,8 +595,9 @@ unsafe extern "system" fn enum_next(
 
 unsafe extern "system" fn enum_skip(this: *mut c_void, count: u32) -> HRESULT {
     let object = unsafe { &mut *(this as *mut FormatEnumerator) };
-    let available = u32::from(object.index == 0);
-    object.index = 1;
+    let available = (object.formats.len() as u32).saturating_sub(object.index);
+    let skipped = count.min(available);
+    object.index += skipped;
     if count <= available { S_OK } else { S_FALSE }
 }
 
@@ -506,6 +617,7 @@ unsafe extern "system" fn enum_clone(
     let clone = Box::new(FormatEnumerator {
         vtable: &ENUM_FORMATETC_VTABLE,
         references: AtomicU32::new(1),
+        formats: object.formats.clone(),
         index: object.index,
     });
     unsafe { *output = Box::into_raw(clone) as *mut IEnumFORMATETC };
@@ -515,6 +627,16 @@ unsafe extern "system" fn enum_clone(
 fn file_drop_format() -> FORMATETC {
     FORMATETC {
         cfFormat: CF_HDROP,
+        ptd: null_mut(),
+        dwAspect: DVASPECT_CONTENT,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL as u32,
+    }
+}
+
+fn global_memory_format(format: u16) -> FORMATETC {
+    FORMATETC {
+        cfFormat: format,
         ptd: null_mut(),
         dwAspect: DVASPECT_CONTENT,
         lindex: -1,
