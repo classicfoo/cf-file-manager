@@ -7,6 +7,7 @@ A small desktop file manager written in Rust with [egui](https://www.egui.rs/). 
 ## Features
 
 - Browse folders from the sidebar, address bar, back/forward history, and parent-folder button.
+- Pin frequently used folders in the sidebar; pinned folders are saved between sessions.
 - Search the current folder and toggle dot-prefixed hidden files.
 - View file type, size, and modified time; open files with the system's default app.
 - Create folders, rename items, and delete files or folders after confirmation.

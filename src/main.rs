@@ -59,6 +59,7 @@ enum DialogAction {
 
 struct FileManagerApp {
     current_dir: PathBuf,
+    pinned_folders: Vec<PathBuf>,
     path_input: String,
     entries: Vec<FileEntry>,
     selected: Option<PathBuf>,
@@ -89,6 +90,7 @@ impl FileManagerApp {
         let current_dir = fs::canonicalize(&home).unwrap_or(home);
         let mut app = Self {
             current_dir: current_dir.clone(),
+            pinned_folders: load_pinned_folders(),
             path_input: current_dir.to_string_lossy().into_owned(),
             entries: Vec::new(),
             selected: None,
@@ -205,6 +207,64 @@ impl FileManagerApp {
         }
     }
 
+    fn is_pinned(&self, path: &Path) -> bool {
+        self.pinned_folders.iter().any(|pinned| pinned == path)
+    }
+
+    fn pin_folder(&mut self, path: &Path) {
+        let canonical_path = match fs::canonicalize(path) {
+            Ok(path) if path.is_dir() => path,
+            Ok(_) => {
+                self.status = Some("Only folders can be pinned.".to_owned());
+                return;
+            }
+            Err(error) => {
+                self.status = Some(format!("Could not pin this folder: {error}"));
+                return;
+            }
+        };
+
+        if self.is_pinned(&canonical_path) {
+            self.status = Some("This folder is already pinned.".to_owned());
+            return;
+        }
+
+        self.pinned_folders.push(canonical_path);
+        self.status = Some(match self.persist_pinned_folders() {
+            Ok(()) => "Folder added to Pinned.".to_owned(),
+            Err(error) => format!("Folder pinned for this session, but {error}"),
+        });
+    }
+
+    fn unpin_folder(&mut self, path: &Path) {
+        let previous_len = self.pinned_folders.len();
+        self.pinned_folders.retain(|pinned| pinned != path);
+        if self.pinned_folders.len() != previous_len {
+            self.status = Some(match self.persist_pinned_folders() {
+                Ok(()) => "Folder removed from Pinned.".to_owned(),
+                Err(error) => format!("Folder unpinned for this session, but {error}"),
+            });
+        }
+    }
+
+    fn persist_pinned_folders(&self) -> Result<(), String> {
+        pinned_folders_file().and_then(|file| {
+            let parent = file
+                .parent()
+                .ok_or_else(|| "Could not find the settings folder.".to_owned())?;
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("Could not create the settings folder: {error}"))?;
+            let contents = self
+                .pinned_folders
+                .iter()
+                .map(|path| escape_config_path(&path.to_string_lossy()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            fs::write(file, contents)
+                .map_err(|error| format!("Could not save pinned folders: {error}"))
+        })
+    }
+
     fn open_selected(&mut self) {
         let Some(path) = self.selected.clone() else {
             return;
@@ -260,6 +320,7 @@ impl FileManagerApp {
                 }
             }
             DialogAction::Rename { old_path, name } => {
+                let renamed_directory = old_path.is_dir();
                 let parent = old_path
                     .parent()
                     .map(Path::to_path_buf)
@@ -277,9 +338,28 @@ impl FileManagerApp {
                 }
                 match fs::rename(&old_path, &target) {
                     Ok(()) => {
+                        let mut pin_save_result = None;
+                        if renamed_directory {
+                            let mut changed_pins = false;
+                            for pinned in &mut self.pinned_folders {
+                                if let Ok(relative) = pinned.strip_prefix(&old_path) {
+                                    *pinned = target.join(relative);
+                                    changed_pins = true;
+                                }
+                            }
+                            if changed_pins {
+                                pin_save_result = Some(self.persist_pinned_folders());
+                            }
+                        }
                         self.selected = Some(target);
                         self.refresh();
-                        self.status = Some("Item renamed.".to_owned());
+                        self.status = Some(match pin_save_result {
+                            Some(Ok(())) => "Item renamed and pinned paths updated.".to_owned(),
+                            Some(Err(error)) => format!(
+                                "Item renamed, but pinned paths could not be saved: {error}"
+                            ),
+                            None => "Item renamed.".to_owned(),
+                        });
                     }
                     Err(error) => self.status = Some(format!("Could not rename item: {error}")),
                 }
@@ -292,9 +372,22 @@ impl FileManagerApp {
                 };
                 match result {
                     Ok(()) => {
+                        let previous_len = self.pinned_folders.len();
+                        self.pinned_folders
+                            .retain(|pinned| !pinned.starts_with(&path));
+                        let pin_status = if self.pinned_folders.len() != previous_len {
+                            self.persist_pinned_folders().err().map(|error| {
+                                format!(
+                                    "Item deleted, but pinned folders could not be saved: {error}"
+                                )
+                            })
+                        } else {
+                            None
+                        };
                         self.selected = None;
                         self.refresh();
-                        self.status = Some("Item deleted.".to_owned());
+                        self.status =
+                            Some(pin_status.unwrap_or_else(|| "Item deleted.".to_owned()));
                     }
                     Err(error) => self.status = Some(format!("Could not delete item: {error}")),
                 }
@@ -469,6 +562,9 @@ impl FileManagerApp {
 
     fn show_sidebar(&mut self, ui: &mut egui::Ui) -> Option<PathBuf> {
         let mut requested_path = None;
+        let mut pin_current = false;
+        let mut remove_pinned = None;
+        let pinned_folders = self.pinned_folders.clone();
         egui::Panel::left("places")
             .resizable(true)
             .default_size(205.0)
@@ -480,39 +576,100 @@ impl FileManagerApp {
                     .inner_margin(egui::Margin::symmetric(12, 14)),
             )
             .show(ui, |ui| {
-                ui.label(egui::RichText::new("PLACES").small().strong().color(MUTED));
-                ui.add_space(8.0);
-                if let Some(home) = home_dir() {
-                    for (label, path) in standard_places(&home) {
-                        let active = self.current_dir == path;
-                        if place_button(ui, place_icon(label), label, active).clicked() {
-                            requested_path = Some(path);
+                egui::ScrollArea::vertical()
+                    .id_salt("sidebar_scroll")
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("PLACES").small().strong().color(MUTED));
+                        ui.add_space(8.0);
+                        if let Some(home) = home_dir() {
+                            for (label, path) in standard_places(&home) {
+                                let active = self.current_dir == path;
+                                if place_button(ui, place_icon(label), label, active).clicked() {
+                                    requested_path = Some(path);
+                                }
+                            }
                         }
-                    }
-                }
 
-                ui.add_space(18.0);
-                ui.label(
-                    egui::RichText::new("FILESYSTEM")
-                        .small()
-                        .strong()
-                        .color(MUTED),
-                );
-                ui.add_space(8.0);
-                for root in filesystem_roots() {
-                    let active = self.current_dir == root;
-                    let label = root_label(&root);
-                    if place_button(ui, Icon::Drive, &label, active).clicked() {
-                        requested_path = Some(root);
-                    }
-                }
+                        ui.add_space(18.0);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("PINNED").small().strong().color(MUTED));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let already_pinned = self.is_pinned(&self.current_dir);
+                                    if ui
+                                        .add_enabled(!already_pinned, egui::Button::new("+"))
+                                        .on_hover_text("Pin the current folder")
+                                        .clicked()
+                                    {
+                                        pin_current = true;
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(8.0);
+                        for path in &pinned_folders {
+                            let label = path
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                            let active = self.current_dir == *path;
+                            ui.horizontal(|ui| {
+                                let button_width = (ui.available_width() - 26.0).max(80.0);
+                                if place_button_sized(
+                                    ui,
+                                    Icon::Folder,
+                                    &label,
+                                    active,
+                                    button_width,
+                                )
+                                .on_hover_text(path.display().to_string())
+                                .clicked()
+                                {
+                                    requested_path = Some(path.clone());
+                                }
+                                if ui
+                                    .add_sized([22.0, 24.0], egui::Button::new("×"))
+                                    .on_hover_text("Remove from Pinned")
+                                    .clicked()
+                                {
+                                    remove_pinned = Some(path.clone());
+                                }
+                            });
+                        }
+
+                        ui.add_space(18.0);
+                        ui.label(
+                            egui::RichText::new("FILESYSTEM")
+                                .small()
+                                .strong()
+                                .color(MUTED),
+                        );
+                        ui.add_space(8.0);
+                        for root in filesystem_roots() {
+                            let active = self.current_dir == root;
+                            let label = root_label(&root);
+                            if place_button(ui, Icon::Drive, &label, active).clicked() {
+                                requested_path = Some(root);
+                            }
+                        }
+                    });
             });
+
+        if pin_current {
+            let current_dir = self.current_dir.clone();
+            self.pin_folder(&current_dir);
+        }
+        if let Some(path) = remove_pinned {
+            self.unpin_folder(&path);
+        }
         requested_path
     }
 
     fn show_file_list(&mut self, ui: &mut egui::Ui) {
         let mut clicked_path = None;
         let mut opened_path = None;
+        let mut pin_action = None;
         let entries = self.filtered_entries();
         let selected = self.selected.clone();
 
@@ -564,6 +721,20 @@ impl FileManagerApp {
                         if response.double_clicked() {
                             opened_path = Some(entry.path.clone());
                         }
+                        if entry.is_dir {
+                            response.context_menu(|ui| {
+                                let pinned = self.is_pinned(&entry.path);
+                                let label = if pinned {
+                                    "Remove from Pinned"
+                                } else {
+                                    "Pin folder"
+                                };
+                                if ui.button(label).clicked() {
+                                    pin_action = Some((entry.path.clone(), pinned));
+                                    ui.close();
+                                }
+                            });
+                        }
                     }
                 });
             });
@@ -578,6 +749,13 @@ impl FileManagerApp {
                 self.status = Some(format!("Could not open file: {error}"));
             } else {
                 self.status = Some("Opened with the system's default app.".to_owned());
+            }
+        }
+        if let Some((path, was_pinned)) = pin_action {
+            if was_pinned {
+                self.unpin_folder(&path);
+            } else {
+                self.pin_folder(&path);
             }
         }
     }
@@ -761,6 +939,88 @@ fn home_dir() -> Option<PathBuf> {
     home.map(PathBuf::from)
 }
 
+fn pinned_folders_file() -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    let config_dir = env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .map(|path| path.join("CF File Manager"))
+        .ok_or_else(|| "Could not find the application data folder.".to_owned())?;
+
+    #[cfg(target_os = "macos")]
+    let config_dir = home_dir()
+        .map(|path| {
+            path.join("Library")
+                .join("Application Support")
+                .join("CF File Manager")
+        })
+        .ok_or_else(|| "Could not find the application data folder.".to_owned())?;
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let config_dir = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|path| path.join(".config")))
+        .map(|path| path.join("cf-file-manager"))
+        .ok_or_else(|| "Could not find the application data folder.".to_owned())?;
+
+    Ok(config_dir.join("pinned-folders.txt"))
+}
+
+fn load_pinned_folders() -> Vec<PathBuf> {
+    let Ok(file) = pinned_folders_file() else {
+        return Vec::new();
+    };
+    let Ok(contents) = fs::read_to_string(file) else {
+        return Vec::new();
+    };
+
+    let mut folders = Vec::new();
+    for line in contents.lines() {
+        let path = PathBuf::from(unescape_config_path(line));
+        let Ok(path) = fs::canonicalize(path) else {
+            continue;
+        };
+        if path.is_dir() && !folders.contains(&path) {
+            folders.push(path);
+        }
+    }
+    folders
+}
+
+fn escape_config_path(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len());
+    for character in path.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn unescape_config_path(path: &str) -> String {
+    let mut unescaped = String::with_capacity(path.len());
+    let mut characters = path.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            unescaped.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some('\\') => unescaped.push('\\'),
+            Some('n') => unescaped.push('\n'),
+            Some('r') => unescaped.push('\r'),
+            Some(other) => {
+                unescaped.push('\\');
+                unescaped.push(other);
+            }
+            None => unescaped.push('\\'),
+        }
+    }
+    unescaped
+}
+
 fn standard_places(home: &Path) -> Vec<(&'static str, PathBuf)> {
     [
         ("Home", home.to_path_buf()),
@@ -860,8 +1120,18 @@ fn icon_button(
 }
 
 fn place_button(ui: &mut egui::Ui, icon: Icon, label: &str, selected: bool) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 27.0), Sense::click());
+    let width = ui.available_width();
+    place_button_sized(ui, icon, label, selected, width)
+}
+
+fn place_button_sized(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    selected: bool,
+    width: f32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 27.0), Sense::click());
     if selected || response.hovered() {
         ui.painter().rect_filled(
             rect,
