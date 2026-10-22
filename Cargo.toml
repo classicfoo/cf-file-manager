@@ -8,7 +8,7 @@ license = "MIT"
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
-egui-classic95 = { git = "https://github.com/classicfoo/egui-classic95.git", rev = "e36318dd1c68069604efd0bbb1c97e51788c07bb" }
+egui-classic95 = { git = "https://github.com/classicfoo/egui-classic95.git", rev = "b923f0d840518d8769ec7399f6102815a286e712" }
 open = "5.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
