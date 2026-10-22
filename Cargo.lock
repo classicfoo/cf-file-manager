@@ -260,6 +260,7 @@ dependencies = [
  "chrono",
  "eframe",
  "open",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

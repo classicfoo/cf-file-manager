@@ -7,6 +7,9 @@ use std::{
 use chrono::{DateTime, Local};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Vec2};
 
+#[cfg(windows)]
+mod windows_file_drag;
+
 const ACCENT: Color32 = Color32::from_rgb(88, 155, 255);
 const PANEL: Color32 = Color32::from_rgb(24, 29, 38);
 const SURFACE: Color32 = Color32::from_rgb(31, 37, 48);
@@ -793,6 +796,8 @@ impl FileManagerApp {
         let mut opened_path = None;
         let mut pin_action = None;
         let mut drop_action = None;
+        #[cfg(windows)]
+        let mut external_drag_result = None;
         let entries = self.filtered_entries();
         let selected = self.selected.clone();
 
@@ -846,6 +851,19 @@ impl FileManagerApp {
                     for entry in &entries {
                         let is_selected = selected.as_ref() == Some(&entry.path);
                         let response = draw_file_row(ui, entry, is_selected, widths);
+                        #[cfg(windows)]
+                        {
+                            let ctrl_down = ui.input(|input| input.modifiers.ctrl);
+                            let drag_out =
+                                response.drag_started_by(egui::PointerButton::Primary) && ctrl_down;
+                            if drag_out {
+                                external_drag_result =
+                                    Some(windows_file_drag::drag_path(&entry.path));
+                            } else if !ctrl_down {
+                                response.dnd_set_drag_payload(entry.path.clone());
+                            }
+                        }
+                        #[cfg(not(windows))]
                         response.dnd_set_drag_payload(entry.path.clone());
                         if response.clicked() {
                             clicked_path = Some(entry.path.clone());
@@ -908,6 +926,14 @@ impl FileManagerApp {
         }
         if let Some((source, destination)) = drop_action {
             self.move_item_to(&source, &destination);
+        }
+        #[cfg(windows)]
+        if let Some(result) = external_drag_result {
+            self.status = Some(match result {
+                Ok(true) => "Dropped into another app.".to_owned(),
+                Ok(false) => "External drag canceled.".to_owned(),
+                Err(error) => format!("Could not start external drag: {error}"),
+            });
         }
     }
 
@@ -1837,11 +1863,14 @@ fn draw_file_row(
         );
         left += column_width;
     }
-    response.on_hover_text(if entry.is_symlink {
-        "Symbolic link"
+    let mut hint = if entry.is_symlink {
+        "Symbolic link".to_owned()
     } else {
-        "Double-click to open"
-    })
+        "Double-click to open".to_owned()
+    };
+    #[cfg(windows)]
+    hint.push_str("\nCtrl+drag to drop into another app.");
+    response.on_hover_text(hint)
 }
 
 fn format_size(mut size: u64) -> String {
